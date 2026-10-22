@@ -1,91 +1,124 @@
-<h1 align="center">Moodle Content Automator</h1>
-<p align="center">
-    <img alt="life" width="550" src="moodle-scraper.gif">
-</p>
+# Moodle Content Automator
 
-Automate the process of downloading course materials from your university's Moodle website with this Python script. The script securely logs in using provided credentials, automatically detects new content across all enrolled courses, and efficiently downloads all relevant materials to a designated local directory.
+Moodle Content Automator is a command-line tool that logs in to a Moodle
+installation, discovers all courses in which the user is enrolled, and
+synchronizes their downloadable course materials to a local directory.
 
-## Table of Contents
-
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Usage](#usage)
-- [License](#license)
+Features include Moodle REST API authentication, enrolled-course discovery,
+incremental file synchronization, automatic recovery of deleted downloads,
+secure password prompting, credential-file support, configurable download and
+state paths, request timeouts, and fully documented CLI options. Parts of the
+implementation and documentation were developed with AI assistance.
 
 ## Requirements
 
-- [Python](https://www.python.org/) (version 3.6 or later)
-- [Requests](https://docs.python-requests.org/en/latest/) library
+- Python 3.6 or newer
+- The [`requests`](https://docs.python-requests.org/) package
+- A Moodle account with access to the Moodle mobile app web service
 
 ## Installation
 
-1. Clone the repository to your local machine:
-
 ```bash
-git clone https://github.com/zedsalim/moodle-scraper.git
+git clone https://github.com/omar-ezeldin/moodle-scraper.git
 cd moodle-scraper
+python -m venv .venv
+source .venv/bin/activate       # Windows: .venv\Scripts\activate
+python -m pip install -r requirements.txt
 ```
 
-2. Optionally, create a virtual environment:
-
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows, use 'venv\Scripts\activate'
-```
-
-3. Install the required dependencies:
-
-```bash
-pip install requests
-```
+You can provide settings through the CLI or a local `cred.json` file, which is
+ignored by Git.
 
 ## Usage
 
-### 1. Configuration (config.py):
-
-#### Credentials (config.py)
-
-Update the `MOODLE_USERNAME` and `MOODLE_PASSWORD` variables with your Moodle login credentials:
-
-```python
-# Credentials
-MOODLE_USERNAME = "your_username"
-MOODLE_PASSWORD = "your_password"
-```
-
-#### Moodle URL (config.py)
-
-Update the `MOODLE_URL` with your university's Moodle platform URL:
-
-```python
-# Moodle URL
-MOODLE_URL = "https://elearning.university-site.edu"
-```
-
-#### Download Path (config.py)
-
-Update the `DOWNLOAD_DIR` variable with the local directory path to store the downloaded files:
-
-```python
-# Download path
-DOWNLOAD_DIR = "moodle_downloads"
-STATE_FILE = "last_check.json"
-```
-
-### 2. Run the moodle-scraper.py script:
+Run a synchronization with the required site and username options:
 
 ```bash
+python moodle-scraper.py \
+  --url https://elearning.example.edu \
+  --username your_username
+```
+
+For repeated use, copy the example credentials file and edit the copy:
+
+```bash
+cp cred.example.json cred.json
+chmod 600 cred.json
 python moodle-scraper.py
 ```
 
-The script will authenticate, automatically scan all your enrolled courses, and download new or missing course materials to the designated directory.
+The credentials file uses this format:
 
-# Important Note:
+```json
+{
+  "url": "https://elearning.example.edu",
+  "username": "your_username",
+  "password": "your_password"
+}
+```
 
-This script is for personal and educational use only. Do not engage in unauthorized or malicious activities.
+Use another credentials file with `--credentials PATH`. CLI options override
+matching values from the credentials file, so a password can still be entered
+securely with `--password` omitted from the JSON file.
 
-## License
+The password is requested through a hidden prompt. For non-interactive
+environments, it can be supplied explicitly:
 
-This project is licensed under the [MIT License](LICENSE).
-[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-Feel free to modify and enhance the scraper according to your needs!
+```bash
+python moodle-scraper.py \
+  --url https://elearning.example.edu \
+  --username your_username \
+  --password 'your_password' \
+  --download-dir ~/Moodle \
+  --state-file ~/.local/state/moodle-scraper.json \
+  --timeout 60
+```
+
+Avoid putting passwords in shell history or process listings when possible;
+the secure prompt is recommended for normal use.
+
+### Options
+
+| Option | Required | Default | Description |
+| --- | --- | --- | --- |
+| `--credentials PATH` | No | `cred.json` | JSON file containing `url`, `username`, and optionally `password` |
+| `--url URL` | No* | From credentials file | Absolute Moodle site URL |
+| `--username USERNAME` | No* | From credentials file | Moodle username |
+| `--password PASSWORD` | No | Secure prompt | Moodle password |
+| `--download-dir PATH` | No | `moodle_downloads` | Directory for downloaded materials |
+| `--state-file PATH` | No | `last_check.json` | JSON file tracking downloaded files |
+| `--timeout SECONDS` | No | `30` | HTTP timeout for each request |
+| `-h`, `--help` | No | — | Show command help |
+
+`*` Required when the value is not present in the credentials file.
+
+The complete option reference is also available from the tool:
+
+```bash
+python moodle-scraper.py --help
+```
+
+## Synchronization behavior
+
+On the first run, all file resources exposed by enrolled courses are
+downloaded. Later runs download newly discovered files and automatically
+restore files that were deleted locally. The state file records file paths and
+timestamps, while downloaded files are organized as:
+
+```text
+moodle_downloads/
+└── Course Name/
+    └── Section Name/
+        └── material.pdf
+```
+
+The state file and download directory are ignored by Git. Use `--state-file`
+to keep separate synchronization histories or to place state outside the
+repository.
+
+## License and credits
+
+This project is released under the [MIT License](LICENSE).
+
+- Original project: [`zedsalim/moodle-scraper`](https://github.com/zedsalim/moodle-scraper)
+- Enhanced CLI/API implementation: [`omar-ezeldin/moodle-scraper`](https://github.com/omar-ezeldin/moodle-scraper)

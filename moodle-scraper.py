@@ -1,23 +1,19 @@
+"""Download and synchronize Moodle course content."""
+
+import argparse
+import getpass
 import json
 import os
+import sys
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
-import config
 
-# Use configuration from config.py
-MOODLE_URL = config.MOODLE_URL
-DOWNLOAD_DIR = config.DOWNLOAD_DIR
-STATE_FILE = config.STATE_FILE
-
-# Global token variable
-TOKEN = None
-
-
-def get_token(username, password):
+def get_token(moodle_url, username, password, timeout):
     """Get authentication token from Moodle"""
-    token_url = f"{MOODLE_URL}/login/token.php"
+    token_url = f"{moodle_url}/login/token.php"
     params = {
         "username": username,
         "password": password,
@@ -25,7 +21,8 @@ def get_token(username, password):
     }
 
     try:
-        response = requests.get(token_url, params=params)
+        response = requests.get(token_url, params=params, timeout=timeout)
+        response.raise_for_status()
         data = response.json()
 
         if "token" in data:
@@ -39,64 +36,91 @@ def get_token(username, password):
             print(f"❌ Unexpected response: {data}")
             return None
 
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         print(f"❌ Failed to get token: {e}")
         return None
 
 
-def call_moodle_api(function, params={}):
+def call_moodle_api(moodle_url, token, function, params, timeout):
     """Call Moodle Web Service API"""
-    url = f"{MOODLE_URL}/webservice/rest/server.php"
-    params.update(
-        {"wstoken": TOKEN, "wsfunction": function, "moodlewsrestformat": "json"}
-    )
-    response = requests.get(url, params=params)
-    return response.json()
+    url = f"{moodle_url}/webservice/rest/server.php"
+    request_params = {
+        **params,
+        "wstoken": token,
+        "wsfunction": function,
+        "moodlewsrestformat": "json",
+    }
+    response = requests.get(url, params=request_params, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    if isinstance(data, dict) and "exception" in data:
+        raise RuntimeError(data.get("message", "Moodle API request failed"))
+    return data
 
 
-def get_enrolled_courses():
+def get_enrolled_courses(moodle_url, token, timeout):
     """Get all enrolled courses"""
     # First get your user ID
-    user_info = call_moodle_api("core_webservice_get_site_info")
+    user_info = call_moodle_api(
+        moodle_url, token, "core_webservice_get_site_info", {}, timeout
+    )
     userid = user_info["userid"]
 
     # Get enrolled courses
-    courses = call_moodle_api("core_enrol_get_users_courses", {"userid": userid})
+    courses = call_moodle_api(
+        moodle_url,
+        token,
+        "core_enrol_get_users_courses",
+        {"userid": userid},
+        timeout,
+    )
     return courses
 
 
-def get_course_contents(course_id):
+def get_course_contents(moodle_url, token, course_id, timeout):
     """Get all contents of a course"""
-    contents = call_moodle_api("core_course_get_contents", {"courseid": course_id})
+    contents = call_moodle_api(
+        moodle_url,
+        token,
+        "core_course_get_contents",
+        {"courseid": course_id},
+        timeout,
+    )
     return contents
 
 
-def download_file(file_url, file_path):
+def download_file(file_url, file_path, token, timeout):
     """Download file from Moodle"""
-    # Add token to file URL
-    download_url = f"{file_url}&token={TOKEN}"
-
-    response = requests.get(download_url, stream=True)
+    try:
+        response = requests.get(
+            file_url, params={"token": token}, stream=True, timeout=timeout
+        )
+    except requests.RequestException as error:
+        print(f"  ❌ Download failed: {error}")
+        return False
     if response.status_code == 200:
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         return True
+    print(f"  ❌ Download failed ({response.status_code}): {file_url}")
     return False
 
 
-def load_state():
+def load_state(state_file):
     """Load last check state"""
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
+    if os.path.exists(state_file):
+        with open(state_file, "r") as f:
             return json.load(f)
     return {}
 
 
-def save_state(state):
+def save_state(state, state_file):
     """Save current state"""
-    with open(STATE_FILE, "w") as f:
+    state_dir = os.path.dirname(os.path.abspath(state_file))
+    os.makedirs(state_dir, exist_ok=True)
+    with open(state_file, "w") as f:
         json.dump(state, f, indent=2)
 
 
@@ -132,29 +156,105 @@ def clean_state(state):
     return cleaned_state
 
 
-def main():
-    global TOKEN
+def safe_name(value):
+    """Return a filesystem-friendly course name."""
+    return "".join(c for c in value if c.isalnum() or c in (" ", "-", "_")).strip()
 
-    # Get credentials from config file
-    username = config.MOODLE_USERNAME
-    password = config.MOODLE_PASSWORD
+
+def normalize_url(url):
+    """Normalize a Moodle site URL without changing its path."""
+    parsed = urlsplit(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("Moodle URL must be an absolute http:// or https:// URL")
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Synchronize materials from all enrolled Moodle courses."
+    )
+    parser.add_argument(
+        "--credentials",
+        default="cred.json",
+        help="JSON credentials file (default: %(default)s)",
+    )
+    parser.add_argument("--url", help="Moodle site URL; overrides the credentials file")
+    parser.add_argument("--username", help="Moodle username; overrides the credentials file")
+    parser.add_argument(
+        "--password",
+        help="Moodle password (omit to enter it securely at the prompt)",
+    )
+    parser.add_argument(
+        "--download-dir",
+        default="moodle_downloads",
+        help="Directory for downloaded files (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--state-file",
+        default="last_check.json",
+        help="JSON file used to track downloads (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30,
+        help="HTTP timeout in seconds (default: %(default)s)",
+    )
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    credentials = {}
+    if os.path.exists(args.credentials):
+        try:
+            with open(args.credentials, "r", encoding="utf-8") as credentials_file:
+                credentials = json.load(credentials_file)
+        except (OSError, json.JSONDecodeError) as error:
+            print(f"❌ Failed to read credentials file: {error}", file=sys.stderr)
+            return 2
+        if not isinstance(credentials, dict):
+            print("❌ Credentials file must contain a JSON object.", file=sys.stderr)
+            return 2
+
+    moodle_url_value = args.url or credentials.get("url")
+    username = args.username or credentials.get("username")
+    password = args.password or credentials.get("password")
+    if not moodle_url_value or not username:
+        print(
+            "❌ Provide --url and --username, or add them to the credentials file.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        moodle_url = normalize_url(moodle_url_value)
+    except ValueError as error:
+        print(f"❌ {error}", file=sys.stderr)
+        return 2
+    if args.timeout <= 0:
+        print("❌ --timeout must be greater than zero", file=sys.stderr)
+        return 2
+
+    password = password or getpass.getpass("Moodle password: ")
 
     # Get token
     print("🔑 Authenticating...")
-    TOKEN = get_token(username, password)
+    token = get_token(moodle_url, username, password, args.timeout)
 
-    if not TOKEN:
-        print("❌ Failed to authenticate. Please check your credentials in config.py")
-        return
+    if not token:
+        print("❌ Failed to authenticate. Please check your credentials.")
+        return 1
 
     print("✅ Authentication successful!")
     print("🔍 Checking for new Moodle content...")
 
     # Create download directory
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(args.download_dir, exist_ok=True)
 
     # Load previous state
-    state = load_state()
+    state = load_state(args.state_file)
 
     # Clean state - remove entries for deleted files
     state = clean_state(state)
@@ -166,7 +266,11 @@ def main():
 
     new_items = []
     redownloaded_items = []
-    courses = get_enrolled_courses()
+    try:
+        courses = get_enrolled_courses(moodle_url, token, args.timeout)
+    except (requests.RequestException, RuntimeError, KeyError, ValueError) as error:
+        print(f"❌ Failed to fetch enrolled courses: {error}")
+        return 1
 
     for course in courses:
         course_id = course["id"]
@@ -174,7 +278,11 @@ def main():
         print(f"\n📚 Course: {course_name}")
 
         # Get course contents
-        contents = get_course_contents(course_id)
+        try:
+            contents = get_course_contents(moodle_url, token, course_id, args.timeout)
+        except (requests.RequestException, RuntimeError, ValueError) as error:
+            print(f"❌ Failed to fetch course contents: {error}")
+            continue
 
         for section in contents:
             section_name = section["name"]
@@ -207,13 +315,9 @@ def main():
                                 file_url = content["fileurl"]
 
                                 # Create safe file path
-                                safe_course = "".join(
-                                    c
-                                    for c in course_name
-                                    if c.isalnum() or c in (" ", "-", "_")
-                                )
+                                safe_course = safe_name(course_name)
                                 file_path = os.path.join(
-                                    DOWNLOAD_DIR, safe_course, section_name, file_name
+                                    args.download_dir, safe_course, section_name, file_name
                                 )
 
                                 # Check if file is new or missing
@@ -238,7 +342,9 @@ def main():
                                     else:
                                         print(f"  ⬇️  Downloading: {file_name}")
 
-                                    if download_file(file_url, file_path):
+                                    if download_file(
+                                        file_url, file_path, token, args.timeout
+                                    ):
                                         state[file_key] = {
                                             "path": file_path,
                                             "downloaded": datetime.now().isoformat(),
@@ -257,7 +363,7 @@ def main():
                         state[module_key] = datetime.now().isoformat()
 
     # Save state
-    save_state(state)
+    save_state(state, args.state_file)
 
     # Summary
     print("\n" + "=" * 50)
@@ -276,8 +382,9 @@ def main():
         if not redownloaded_items:
             print("✅ No new content found")
 
-    print(f"\n💾 Downloads saved to: {DOWNLOAD_DIR}/")
+    print(f"\n💾 Downloads saved to: {args.download_dir}/")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

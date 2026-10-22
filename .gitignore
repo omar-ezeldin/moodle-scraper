@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local credentials and synchronization state
+cred.json
+last_check.json
+moodle_downloads/
