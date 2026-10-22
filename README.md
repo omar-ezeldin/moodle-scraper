@@ -86,8 +86,13 @@ the secure prompt is recommended for normal use.
 | `--username USERNAME` | No* | From credentials file | Moodle username |
 | `--password PASSWORD` | No | Secure prompt | Moodle password |
 | `--download-dir PATH` | No | `moodle_downloads` | Directory for downloaded materials |
-| `--state-file PATH` | No | `last_check.json` | JSON file tracking downloaded files |
+| `--state-file PATH` | No | `download-map.json` | JSON map of included courses, folders, and downloaded files |
 | `--timeout SECONDS` | No | `30` | HTTP timeout for each request |
+| `--course ID_OR_NAME` | No | All courses | Synchronize only the selected course; repeat for multiple courses |
+| `--list-courses` | No | — | List enrolled courses and exit |
+| `--configure-courses` | No | — | Interactively select and save courses for future syncs |
+| `--course-config PATH` | No | `courses.json` | JSON file storing the saved course selection |
+| `--update` | No | — | Check the download map and download only missing files |
 | `-h`, `--help` | No | — | Show command help |
 
 `*` Required when the value is not present in the credentials file.
@@ -97,6 +102,60 @@ The complete option reference is also available from the tool:
 ```bash
 python moodle-scraper.py --help
 ```
+
+List available courses before selecting one:
+
+```bash
+python moodle-scraper.py --list-courses
+```
+
+Select a course by its Moodle ID or exact name:
+
+```bash
+python moodle-scraper.py --course 42
+python moodle-scraper.py --course "Introduction to Python"
+```
+
+Repeat `--course` to synchronize multiple selected courses.
+
+### Saved course selection
+
+Use the interactive configuration command to choose which enrolled courses
+should be synchronized by default:
+
+```bash
+python moodle-scraper.py --configure-courses
+```
+
+The command displays every enrolled course and accepts selections such as
+`1,3,5` or `all`. The selected course IDs and names are saved to
+`courses.json`, which is ignored by Git. Future runs automatically use that
+selection:
+
+```bash
+python moodle-scraper.py
+```
+
+Use `--course-config PATH` to save or use a different selection file.
+Explicit `--course` options override the saved selection, and running without
+a saved selection synchronizes all enrolled courses.
+
+### Download map and updates
+
+Each synchronization writes a JSON download map containing the included
+courses, destination folders, file paths, Moodle URLs, and course metadata.
+The default map is `download-map.json`; use `--state-file PATH` to choose a
+different location.
+
+To verify the selected courses and download only files missing from disk:
+
+```bash
+python moodle-scraper.py --update
+```
+
+The update command never overwrites files that are already present. It also
+records newly discovered remote files in the map and downloads them if they are
+missing locally.
 
 ## Synchronization behavior
 

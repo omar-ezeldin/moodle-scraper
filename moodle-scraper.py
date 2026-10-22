@@ -108,52 +108,87 @@ def download_file(file_url, file_path, token, timeout):
     return False
 
 
-def load_state(state_file):
-    """Load last check state"""
-    if os.path.exists(state_file):
-        with open(state_file, "r") as f:
-            return json.load(f)
-    return {}
+def load_download_map(map_file):
+    """Load the download map, including legacy state files."""
+    if not os.path.exists(map_file):
+        return {"included_courses": [], "folders": [], "files": {}}
+    try:
+        with open(map_file, "r", encoding="utf-8") as map_handle:
+            data = json.load(map_handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Failed to read download map: {error}") from error
+    if (
+        isinstance(data, dict)
+        and isinstance(data.get("files"), dict)
+        and isinstance(data.get("included_courses"), list)
+    ):
+        data.setdefault("folders", [])
+        return data
+    if not isinstance(data, dict):
+        raise ValueError("Download map must contain a JSON object.")
+    # Preserve maps created by earlier versions.
+    files = {
+        value["path"]: value
+        for value in data.values()
+        if isinstance(value, dict) and "path" in value
+    }
+    return {"included_courses": [], "folders": [], "files": files}
 
 
-def save_state(state, state_file):
-    """Save current state"""
-    state_dir = os.path.dirname(os.path.abspath(state_file))
-    os.makedirs(state_dir, exist_ok=True)
-    with open(state_file, "w") as f:
-        json.dump(state, f, indent=2)
+def save_download_map(download_map, map_file):
+    """Save the download map."""
+    map_dir = os.path.dirname(os.path.abspath(map_file))
+    os.makedirs(map_dir, exist_ok=True)
+    with open(map_file, "w", encoding="utf-8") as map_handle:
+        json.dump(download_map, map_handle, indent=2)
+
+
+def clean_download_map(download_map):
+    """Remove files from the map that no longer exist on disk."""
+    existing_files = {}
+    removed_count = 0
+    for path, metadata in download_map["files"].items():
+        if file_exists(path):
+            existing_files[path] = metadata
+        else:
+            removed_count += 1
+    download_map["files"] = existing_files
+    if removed_count:
+        print(f"📊 Found {removed_count} missing file(s) in the download map\n")
+    return download_map
+
+
+def add_to_download_map(download_map, course, file_path, file_url, section_name):
+    """Record a course, folder, and file in the download map."""
+    course_entry = {
+        "id": course["id"],
+        "name": course["fullname"],
+    }
+    if course_entry not in download_map["included_courses"]:
+        download_map["included_courses"].append(course_entry)
+    folder_path = os.path.dirname(file_path)
+    if folder_path not in download_map["folders"]:
+        download_map["folders"].append(folder_path)
+    download_map["files"][file_path] = {
+        "url": file_url,
+        "course_id": course["id"],
+        "course": course["fullname"],
+        "section": section_name,
+        "downloaded": file_exists(file_path),
+        "updated": datetime.now().isoformat(),
+    }
 
 
 def file_exists(file_path):
-    """Check if file exists on disk"""
+    """Check if file exists on disk."""
     return os.path.isfile(file_path)
 
 
-def clean_state(state):
-    """Remove entries from state where files no longer exist"""
-    cleaned_state = {}
-    removed_count = 0
-
-    for key, value in state.items():
-        # Skip module-only keys (they don't have file paths)
-        if "_" in key and not key.count("_") > 2:
-            cleaned_state[key] = value
-            continue
-
-        # For file keys, check if they contain actual file tracking info
-        if isinstance(value, dict) and "path" in value:
-            if file_exists(value["path"]):
-                cleaned_state[key] = value
-            else:
-                removed_count += 1
-                print(f"  🗑️  Removed missing file from state: {value['path']}")
-        else:
-            cleaned_state[key] = value
-
-    if removed_count > 0:
-        print(f"📊 Cleaned {removed_count} missing files from state\n")
-
-    return cleaned_state
+def save_state(state, state_file):
+    """Backward-compatible alias for older callers."""
+    state_dir = os.path.dirname(os.path.abspath(state_file))
+    os.makedirs(state_dir, exist_ok=True)
+    save_download_map(state, state_file)
 
 
 def safe_name(value):
@@ -191,8 +226,8 @@ def build_parser():
     )
     parser.add_argument(
         "--state-file",
-        default="last_check.json",
-        help="JSON file used to track downloads (default: %(default)s)",
+        default="download-map.json",
+        help="JSON download map file (default: %(default)s)",
     )
     parser.add_argument(
         "--timeout",
@@ -200,7 +235,83 @@ def build_parser():
         default=30,
         help="HTTP timeout in seconds (default: %(default)s)",
     )
+    parser.add_argument(
+        "--course",
+        action="append",
+        dest="courses",
+        metavar="ID_OR_NAME",
+        help="Only synchronize this course; repeat for multiple courses",
+    )
+    parser.add_argument(
+        "--list-courses",
+        action="store_true",
+        help="List enrolled courses and exit without downloading",
+    )
+    parser.add_argument(
+        "--configure-courses",
+        action="store_true",
+        help="Interactively select courses and save the selection",
+    )
+    parser.add_argument(
+        "--course-config",
+        default="courses.json",
+        help="JSON course selection file (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Check the download map and download only missing files",
+    )
     return parser
+
+
+def load_course_selection(course_config):
+    """Load saved course IDs, if a course selection file exists."""
+    if not os.path.exists(course_config):
+        return None
+    try:
+        with open(course_config, "r", encoding="utf-8") as selection_file:
+            selection = json.load(selection_file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Failed to read course configuration: {error}") from error
+    if not isinstance(selection, dict) or not isinstance(selection.get("course_ids"), list):
+        raise ValueError("Course configuration must contain a course_ids list.")
+    return {str(course_id) for course_id in selection["course_ids"]}
+
+
+def save_course_selection(course_config, courses):
+    """Save selected course IDs and names."""
+    config_dir = os.path.dirname(os.path.abspath(course_config))
+    os.makedirs(config_dir, exist_ok=True)
+    selection = {
+        "course_ids": [course["id"] for course in courses],
+        "courses": [
+            {"id": course["id"], "name": course["fullname"]} for course in courses
+        ],
+    }
+    with open(course_config, "w", encoding="utf-8") as selection_file:
+        json.dump(selection, selection_file, indent=2)
+
+
+def select_courses_interactively(courses):
+    """Prompt for one or more course numbers."""
+    print("\n📚 Enrolled courses:")
+    for index, course in enumerate(courses, start=1):
+        print(f"  {index}. {course['fullname']} (ID: {course['id']})")
+    print("\nEnter course numbers separated by commas, or 'all' for every course.")
+
+    while True:
+        selection = input("Courses to include: ").strip().lower()
+        if selection == "all":
+            return courses
+        try:
+            indexes = [int(value.strip()) for value in selection.split(",")]
+        except ValueError:
+            indexes = []
+        if indexes and all(1 <= index <= len(courses) for index in indexes):
+            selected_indexes = set(indexes)
+            return [courses[index - 1] for index in sorted(selected_indexes)]
+        print("❌ Enter valid course numbers separated by commas, or 'all'.")
 
 
 def main(argv=None):
@@ -247,34 +358,90 @@ def main(argv=None):
         print("❌ Failed to authenticate. Please check your credentials.")
         return 1
 
-    print("✅ Authentication successful!")
-    print("🔍 Checking for new Moodle content...")
-
-    # Create download directory
-    os.makedirs(args.download_dir, exist_ok=True)
-
-    # Load previous state
-    state = load_state(args.state_file)
-
-    # Clean state - remove entries for deleted files
-    state = clean_state(state)
-
-    is_first_run = len(state) == 0
-
-    if is_first_run:
-        print("📦 First run - downloading all content")
-
-    new_items = []
-    redownloaded_items = []
     try:
         courses = get_enrolled_courses(moodle_url, token, args.timeout)
     except (requests.RequestException, RuntimeError, KeyError, ValueError) as error:
         print(f"❌ Failed to fetch enrolled courses: {error}")
         return 1
 
+    if args.list_courses:
+        print("\n📚 Enrolled courses:")
+        for course in courses:
+            print(f"  {course['id']}: {course['fullname']}")
+        return 0
+
+    if args.configure_courses:
+        try:
+            selected_courses = select_courses_interactively(courses)
+            save_course_selection(args.course_config, selected_courses)
+        except (EOFError, KeyboardInterrupt):
+            print("\n❌ Course configuration canceled.", file=sys.stderr)
+            return 130
+        except OSError as error:
+            print(f"❌ Failed to save course configuration: {error}", file=sys.stderr)
+            return 1
+        print(
+            f"✅ Saved {len(selected_courses)} course(s) to {args.course_config}."
+        )
+        return 0
+
+    requested_courses = set(args.courses or [])
+    if not requested_courses:
+        try:
+            requested_courses = load_course_selection(args.course_config) or set()
+        except ValueError as error:
+            print(f"❌ {error}", file=sys.stderr)
+            return 2
+
+    if requested_courses:
+        selected_courses = [
+            course
+            for course in courses
+            if str(course["id"]) in requested_courses
+            or course["fullname"] in requested_courses
+        ]
+        missing_courses = requested_courses - {
+            str(course["id"]) for course in selected_courses
+        } - {course["fullname"] for course in selected_courses}
+        if missing_courses:
+            print(
+                "❌ Course not found: " + ", ".join(sorted(missing_courses)),
+                file=sys.stderr,
+            )
+            print(
+                "Use --list-courses or --configure-courses to update the selection."
+            )
+            return 2
+        courses = selected_courses
+
+    print("✅ Authentication successful!")
+    print("🔍 Checking for new Moodle content...")
+
+    # Create download directory
+    os.makedirs(args.download_dir, exist_ok=True)
+
+    try:
+        download_map = clean_download_map(load_download_map(args.state_file))
+    except ValueError as error:
+        print(f"❌ {error}", file=sys.stderr)
+        return 2
+
+    if not args.update and not download_map["files"]:
+        print("📦 First run - downloading all content")
+
+    new_items = []
+    redownloaded_items = []
+
     for course in courses:
         course_id = course["id"]
         course_name = course["fullname"]
+        if {
+            "id": course_id,
+            "name": course_name,
+        } not in download_map["included_courses"]:
+            download_map["included_courses"].append(
+                {"id": course_id, "name": course_name}
+            )
         print(f"\n📚 Course: {course_name}")
 
         # Get course contents
@@ -293,11 +460,7 @@ def main(argv=None):
                     module_name = module["name"]
                     module_type = module["modname"]
 
-                    # Check if this is new
-                    module_key = f"{course_id}_{module_id}"
-                    is_new = module_key not in state
-
-                    if is_new or is_first_run:
+                    if not args.update:
                         new_items.append(
                             {
                                 "course": course_name,
@@ -319,22 +482,20 @@ def main(argv=None):
                                 file_path = os.path.join(
                                     args.download_dir, safe_course, section_name, file_name
                                 )
-
-                                # Check if file is new or missing
-                                file_key = f"{module_key}_{file_name}"
-                                file_in_state = file_key in state
-                                file_exists_on_disk = file_exists(file_path)
-
-                                # Download if: new file OR file was deleted
-                                should_download = (
-                                    not file_in_state
-                                    or not file_exists_on_disk
-                                    or is_first_run
+                                was_tracked = file_path in download_map["files"]
+                                add_to_download_map(
+                                    download_map,
+                                    course,
+                                    file_path,
+                                    file_url,
+                                    section_name,
                                 )
 
+                                file_exists_on_disk = file_exists(file_path)
+                                should_download = not file_exists_on_disk
+
                                 if should_download:
-                                    # Determine if this is a redownload
-                                    if file_in_state and not file_exists_on_disk:
+                                    if was_tracked:
                                         print(
                                             f"  🔄 Re-downloading deleted file: {file_name}"
                                         )
@@ -345,25 +506,14 @@ def main(argv=None):
                                     if download_file(
                                         file_url, file_path, token, args.timeout
                                     ):
-                                        state[file_key] = {
-                                            "path": file_path,
-                                            "downloaded": datetime.now().isoformat(),
-                                            "course": course_name,
-                                            "module": module_name,
-                                        }
+                                        download_map["files"][file_path]["downloaded"] = True
                                         print(f"  ✅ Downloaded to {file_path}")
                                     else:
+                                        download_map["files"][file_path]["downloaded"] = False
                                         print(f"  ❌ Failed to download")
-                                else:
-                                    # File exists, just verify it's still there
-                                    pass
-
-                    # Mark module as seen
-                    if module_key not in state:
-                        state[module_key] = datetime.now().isoformat()
 
     # Save state
-    save_state(state, args.state_file)
+    save_download_map(download_map, args.state_file)
 
     # Summary
     print("\n" + "=" * 50)

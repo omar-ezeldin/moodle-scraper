@@ -5,5 +5,7 @@ venv/
 
 # Local credentials and synchronization state
 cred.json
+courses.json
+download-map.json
 last_check.json
 moodle_downloads/
