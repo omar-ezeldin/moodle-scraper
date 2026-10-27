@@ -89,6 +89,28 @@ def get_course_contents(moodle_url, token, course_id, timeout):
     return contents
 
 
+def get_activity_files(moodle_url, token, course_ids, timeout):
+    """Get files attached to activities, keyed by course module id.
+
+    core_course_get_contents only lists the files of resource-like modules, so
+    files attached to an assignment's description (as on its page in the app)
+    are fetched here.
+    """
+    params = {f"courseids[{index}]": course_id for index, course_id in enumerate(course_ids)}
+    data = call_moodle_api(
+        moodle_url, token, "mod_assign_get_assignments", params, timeout
+    )
+    activity_files = {}
+    for course in data.get("courses", []):
+        for assignment in course.get("assignments", []):
+            files = assignment.get("introattachments", []) + assignment.get(
+                "introfiles", []
+            )
+            if files:
+                activity_files[assignment["cmid"]] = files
+    return activity_files
+
+
 def download_file(file_url, file_path, token, timeout):
     """Download file from Moodle"""
     try:
@@ -432,6 +454,14 @@ def main(argv=None):
     new_items = []
     redownloaded_items = []
 
+    try:
+        activity_files = get_activity_files(
+            moodle_url, token, [course["id"] for course in courses], args.timeout
+        )
+    except (requests.RequestException, RuntimeError, ValueError) as error:
+        print(f"⚠️  Failed to fetch assignment files: {error}")
+        activity_files = {}
+
     for course in courses:
         course_id = course["id"]
         course_name = course["fullname"]
@@ -470,47 +500,58 @@ def main(argv=None):
                             }
                         )
 
+                    # Files of the module go in its section folder. Files
+                    # attached to an activity go in a folder named after it
+                    # inside the section, made only when it has files.
+                    module_files = [
+                        (content, section_name)
+                        for content in module.get("contents", [])
+                        if content["type"] == "file"
+                    ]
+                    module_files += [
+                        (content, os.path.join(section_name, safe_name(module_name)))
+                        for content in activity_files.get(module_id, [])
+                    ]
+
                     # Download files if available
-                    if "contents" in module:
-                        for content in module["contents"]:
-                            if content["type"] == "file":
-                                file_name = content["filename"]
-                                file_url = content["fileurl"]
+                    for content, folder in module_files:
+                        file_name = content["filename"]
+                        file_url = content["fileurl"]
 
-                                # Create safe file path
-                                safe_course = safe_name(course_name)
-                                file_path = os.path.join(
-                                    args.download_dir, safe_course, section_name, file_name
+                        # Create safe file path
+                        safe_course = safe_name(course_name)
+                        file_path = os.path.join(
+                            args.download_dir, safe_course, folder, file_name
+                        )
+                        was_tracked = file_path in download_map["files"]
+                        add_to_download_map(
+                            download_map,
+                            course,
+                            file_path,
+                            file_url,
+                            section_name,
+                        )
+
+                        file_exists_on_disk = file_exists(file_path)
+                        should_download = not file_exists_on_disk
+
+                        if should_download:
+                            if was_tracked:
+                                print(
+                                    f"  🔄 Re-downloading deleted file: {file_name}"
                                 )
-                                was_tracked = file_path in download_map["files"]
-                                add_to_download_map(
-                                    download_map,
-                                    course,
-                                    file_path,
-                                    file_url,
-                                    section_name,
-                                )
+                                redownloaded_items.append(file_name)
+                            else:
+                                print(f"  ⬇️  Downloading: {file_name}")
 
-                                file_exists_on_disk = file_exists(file_path)
-                                should_download = not file_exists_on_disk
-
-                                if should_download:
-                                    if was_tracked:
-                                        print(
-                                            f"  🔄 Re-downloading deleted file: {file_name}"
-                                        )
-                                        redownloaded_items.append(file_name)
-                                    else:
-                                        print(f"  ⬇️  Downloading: {file_name}")
-
-                                    if download_file(
-                                        file_url, file_path, token, args.timeout
-                                    ):
-                                        download_map["files"][file_path]["downloaded"] = True
-                                        print(f"  ✅ Downloaded to {file_path}")
-                                    else:
-                                        download_map["files"][file_path]["downloaded"] = False
-                                        print(f"  ❌ Failed to download")
+                            if download_file(
+                                file_url, file_path, token, args.timeout
+                            ):
+                                download_map["files"][file_path]["downloaded"] = True
+                                print(f"  ✅ Downloaded to {file_path}")
+                            else:
+                                download_map["files"][file_path]["downloaded"] = False
+                                print(f"  ❌ Failed to download")
 
     # Save state
     save_download_map(download_map, args.state_file)

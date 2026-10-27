@@ -168,8 +168,15 @@ timestamps, while downloaded files are organized as:
 moodle_downloads/
 └── Course Name/
     └── Section Name/
-        └── material.pdf
+        ├── material.pdf
+        └── Assignment Name/
+            └── task.pdf
 ```
+
+Files attached to an assignment (shown on the assignment's page, not as a
+separate course file) go in a folder named after the assignment, inside its
+section. The folder is only created when the assignment has files, so
+assignments without attachments leave no empty folders.
 
 The state file and download directory are ignored by Git. Use `--state-file`
 to keep separate synchronization histories or to place state outside the
